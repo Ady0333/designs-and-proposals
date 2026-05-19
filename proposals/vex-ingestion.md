@@ -96,12 +96,20 @@ For each successful fetch the controller:
 3. Writes/updates one or more `OpenVulnerabilityExchangeContainer` objects, labeled to mark them as externally-sourced (e.g. `kubescape.io/vex-source: redhat-csaf`) so they are not confused with kubevuln-generated VEX.
 4. Updates `VEXSource.status` and emits Events on transitions.
 
+To bound the worst-case behavior of the controller, v1 should enforce hard fetch-safety defaults at the fetcher boundary (before normalization). Suggested starting values, all overridable later:
+
+- request timeout: 10 s per HTTP call
+- max response body: 50 MB per document
+- max documents ingested per sync: 10 000 (feeds larger than this require an incremental cursor — see §5 on feed volume)
+- retry policy: 3 attempts, exponential backoff with ±20 % jitter
+- stale-data behavior: after N consecutive failed syncs, mark `VEXSource.status` as `Stale`, emit an Event, and back off to `refreshInterval × 4` until a successful sync
+
 ### 4.3 Join into the vuln-manifest pipeline
 
 Two integration points, in order of complexity:
 
 **Option A: at scan time, via grype's native `--vex`.**
-kubevuln's grype adapter writes the relevant external VEX documents to a temp dir keyed by image and invokes grype with `--vex <dir>`. Matches that VEX suppresses appear in grype's `ignoredMatches` output, which the adapter already has a field for ([`grype_to_domain.go` L14](https://github.com/kubescape/kubevuln/blob/main/adapters/v1/grype_to_domain.go#L14)). This is the cleanest path because the filtering logic lives where it already lives, in grype, and the resulting CVE manifest is already “VEX-aware” by the time anyone else reads it.
+kubevuln's grype adapter writes the relevant external VEX documents to a per-scan temp directory and invokes grype with one `--vex <file>` per document (the flag is a `stringArray` of file paths, not a directory — see [`cmd/grype/cli/options/grype.go`](https://github.com/anchore/grype/blob/main/cmd/grype/cli/options/grype.go) and [`grype/vex/openvex/implementation.go`](https://github.com/anchore/grype/blob/main/grype/vex/openvex/implementation.go) `ReadVexDocuments` → `openvex.MergeFiles`). OpenVEX and CSAF documents can be mixed in the same invocation; CSAF VEX support landed in [grype v0.99.0](https://github.com/anchore/grype/releases/tag/v0.99.0) (PR [#1826](https://github.com/anchore/grype/pull/1826)) with a refined transformer in [v0.111.0](https://github.com/anchore/grype/releases/tag/v0.111.0) (PR [#3349](https://github.com/anchore/grype/pull/3349)). Matches that VEX suppresses appear in grype's `ignoredMatches` output, which the adapter already has a field for ([`grype_to_domain.go` L14](https://github.com/kubescape/kubevuln/blob/main/adapters/v1/grype_to_domain.go#L14)). This is the cleanest path because the filtering logic lives where it already lives, in grype, and the resulting CVE manifest is already “VEX-aware” by the time anyone else reads it.
 
 **Option B: post-hoc filtering in the repository layer.**
 Apply VEX statements in `cveRepository.StoreCVE` / `StoreCVESummary`, mirroring how the existing `filteredCvep` is derived from relevance and exceptions today ([`scan.go` L340-L362](https://github.com/kubescape/kubevuln/blob/main/core/services/scan.go#L340-L362)). More code to write, but doesn't require kubevuln to materialize files on disk for grype.
@@ -141,6 +149,7 @@ This bridge is **optional** and orthogonal to v1. The minimum-viable VEX ingesti
 - **Failure modes.** A poisoned or stale feed could silently hide real vulnerabilities. We need: per-feed enable/disable, an "ignore VEX from source X" override, and a way to surface "X CVEs are suppressed by VEXSource Y" in scan output so operators see what is being filtered.
 - **Air-gapped clusters.** Mirroring feeds offline (`oras pull`, an OCI ref pointing at a mirrored bundle) needs to be a first-class case. The `url:` field should accept both HTTPS and OCI references.
 - **Overlap with cloud exceptions.** ARMO Cloud already returns exception policies through the existing getter. If a cloud exception, a SecurityException CRD, and a vendor VEX statement all touch the same CVE, what wins? Reuse the cloud-vs-CRD precedence rules being defined for SecurityException.
+- **Egress posture and RBAC.** `VEXSource.spec.url` is operator-fetched, so a permissive default would let any tenant with `create` on the CRD steer the operator's HTTP client at internal services or cloud metadata endpoints. v1 should restrict accepted schemes to `https://` and `oci://`, deny loopback / link-local / RFC1918 / IPv6 ULA / cloud-metadata destinations, treat redirects as new fetches (re-validated against the same policy), and gate `create`/`update` on `(Cluster)VEXSource` to cluster-admin by default in the shipped RBAC.
 
 ## 6. Prior art and references
 
