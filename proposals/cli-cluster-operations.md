@@ -121,6 +121,22 @@ There is also a second, status-returning delivery channel for the *same*
 the GitOps- and Headlamp-friendly path and is how we surface dry-run plans and
 audit results.
 
+#### Delivery Pipeline Decoupling: Standalone vs. Connected
+
+Because Kubescape can be deployed in a variety of environments, this design cleanly supports two distinct command delivery pathways:
+
+1. **Standalone OSS Path (No Synchronizer)**:
+   * **Direct Trigger**: The Kubescape CLI issues a direct HTTPS POST request containing the `apis.Command` payload to the operator's local REST endpoint `/v1/triggerAction` (typically exposed via `kubectl port-forward`). No CRD or Synchronizer is involved.
+   * **GitOps Trigger**: Users apply `OperatorCommand` CRD resources directly to the Kubernetes API using `kubectl apply` or a GitOps engine (like ArgoCD). The operator watches these local resources directly via its watch handler and executes them locally.
+2. **Connected Commercial Path (With Synchronizer)**:
+   * The ARMO backend runs outside the cluster's firewall and cannot call the operator's REST API directly. Instead, it uses the **Synchronizer** as a secure proxy.
+   * When an action is triggered via the ARMO Dashboard, the backend marshals the `apis.Command`, encodes it, and wraps it in a `v1alpha1.OperatorCommand` custom resource with `Spec.CommandType` set to `OperatorCommandTypeOperatorAPI`. It pushes this command down via Pulsar (`synchronizer-in-topic`).
+   * The in-cluster synchronizer component receives this payload and writes the `OperatorCommand` CRD directly to the cluster's local Kubernetes API.
+   * The operator watches and processes the CRD exactly as it would in the standalone GitOps path.
+   * The in-cluster synchronizer watches the CRD status and relays the execution progress back to the backend.
+
+This architectural split keeps the core operator logic completely standalone and decoupled from backend microservices or Synchronizer requirements, while remaining 100% compatible when they are present.
+
 ### Layer 1: the action framework
 
 Introduce a generic action verb:
@@ -350,12 +366,32 @@ new rule block **gated behind a `capabilities.remediation` value** (default
 - **Auditability.** Every action writes `OperatorCommand` status + a Kubernetes
   Event with the justifying finding.
 
-## Open Questions
+## Alignment with ARMO Runtime Incident Processing
 
-1. Action verb naming: single `operatorAction` + `Args.action` (proposed) vs.
-   one `CommandName` per action (`quarantineWorkload`, `cordonNode`)?
-2. Where should the namespace allow/deny list and severity thresholds live:
-   operator `config` ConfigMap, Helm values, or a dedicated `RemediationPolicy`
-   CRD?
-3. Should `quarantine` default to deny-all NetworkPolicy, scale-to-0, or be
-   explicitly chosen per invocation?
+To ensure seamless alignment with ARMO's commercial platform (described in [Runtime Incident/Alert Processing](https://github.com/armosec/shared-designs-and-docs/blob/main/runtime-backend/runtime-incident-processing.md) and implemented in the [event-ingester-service](https://github.com/armosec/event-ingester-service)), this design bridges the open-source operator capabilities and the commercial incident response pipeline:
+
+1. **Pipeline Coexistence**:
+   * **OSS (Decentralized/Local, No Synchronizer)**:
+     * In a pure OSS setting, the Synchronizer is absent.
+     * The CLI interacts directly with the operator's REST API `/v1/triggerAction` to execute commands.
+     * Alternatively, local GitOps loops write `OperatorCommand` CRDs directly to the Kubernetes API, which the operator watches and executes locally.
+   * **Commercial (SaaS/Centralized, With Synchronizer)**:
+     * The ARMO backend (`event-ingester-service`) executes advanced, traffic-aware NetworkPolicy or Seccomp profile generation and pushes these generated manifests directly to the cluster via the Synchronizer.
+     * For active response commands (`Kill`, `Pause`, `Stop`), the backend writes an `OperatorCommand` CRD (wrapped in a Synchronizer message) and relays it through the Pulsar-to-Synchronizer proxy, which applies the CRD to the local Kubernetes API.
+     * The operator watches and processes the CRD exactly like an OSS GitOps flow, keeping the core operator completely decoupled from backend/Pulsar logic.
+   * These two mechanisms are fully complementary. The extensible `operatorAction` framework allows the OSS operator to execute local mutations, while leaving the backend free to invoke advanced or process-level responses.
+
+2. **Common Audit Tracking**: Since both paths write state and results back to the `OperatorCommand` CRD status and emit Kubernetes Events, the ARMO backend's synchronizer will automatically pick up the status transitions (`initiated`, `applied`, `failed`) and write them to the commercial audit log (`v1_audit_log`) and SIEM stream without polling.
+
+3. **Active Response Evolution**: The extensible action registry in `mainhandler/actionhandler.go` is designed to seamlessly adopt process-level active response verbs (`kill`, `pause`, `stop`) in future phases to align with the core `kdr.ResponseType` actions supported in the ARMO commercial platform.
+
+## Resolved Open Questions
+
+1. **Action verb naming: single `operatorAction` + `Args.action` (proposed) vs. one `CommandName` per action (`quarantineWorkload`, `cordonNode`)?**
+   * **Resolved**: Keep the single generic `operatorAction` with `Args.action` parameter. This matches the generic `apis.Command` payload architecture, provides maximum extensibility for future active response verbs (like `kill`, `pause`, `stop`), and avoids repeated modifications to the core communication schemas.
+
+2. **Where should the namespace allow/deny list and severity thresholds live: operator `config` ConfigMap, Helm values, or a dedicated `RemediationPolicy` CRD?**
+   * **Resolved**: Helm values/ConfigMap for Phase 1 (bootstrap and simple local setups), transitioning to standard Policy configuration blocks in subsequent phases. Storing the rules in a structured configuration schema allows the rules to align with ARMO's `IncidentPolicy` scopes (reusing standard label selectors and namespace targets).
+
+3. **Should `quarantine` default to deny-all NetworkPolicy, scale-to-0, or be explicitly chosen per invocation?**
+   * **Resolved**: Default to a non-destructive deny-all NetworkPolicy. In security incident response, preserving container state is critical for forensic investigation (e.g., memory and process trees). Scaling to zero destroys the container, wiping out all forensic evidence. Scaling to zero or container stopping should be an explicit opt-in parameter (like `quarantineMode: scaleToZero` or a separate `stop` action) rather than the default.
