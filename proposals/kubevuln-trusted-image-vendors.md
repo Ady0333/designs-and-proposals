@@ -18,9 +18,9 @@ feeds, already integrated upstream into the Grype database. For these images,
 CPE name-fuzzing adds only false positives: the vendor's feed already
 guarantees completeness.
 
-This proposal introduces a third matching mode: **CPE matching on, except for
-images from trusted vendors**, where kubevuln automatically falls back to
-Grype's default (ecosystem/feed-based) matching. Vendor identification reuses
+This proposal introduces a third matching mode, which becomes the **default**:
+**CPE matching on, except for images from trusted vendors**, where kubevuln
+automatically falls back to Grype's default (ecosystem/feed-based) matching. Vendor identification reuses
 Grype's own distro-detection mechanism: no new identification logic and no
 vendored code.
 
@@ -57,7 +57,7 @@ upside.
 - Let users choose between three matching modes:
   1. **CPE matching off**: Grype default behavior everywhere.
   2. **CPE matching on**: current kubevuln behavior everywhere.
-  3. **Adaptive (proposed default)**: CPE matching on, automatically
+  3. **Adaptive (the default)**: CPE matching on, automatically
      disabled per-scan for images identified as coming from a trusted vendor.
 - Reuse Grype's existing vendor/distro identification, with no parallel
   mechanism.
@@ -107,12 +107,15 @@ A single configuration value with three modes replaces the current boolean
 | Mode | Behavior |
 |------|----------|
 | `off` | Grype defaults everywhere (CPE matching disabled). Equivalent to today's `useDefaultMatchers: true`. |
-| `on` | CPE matching enabled everywhere. Equivalent to today's `useDefaultMatchers: false` (current default). |
-| `adaptive` | CPE matching enabled, except when the scanned image's distro is a trusted vendor, in which case Grype defaults apply for that scan. |
+| `on` | CPE matching enabled everywhere. Equivalent to today's `useDefaultMatchers: false` (today's behavior). |
+| `adaptive` **(default)** | CPE matching enabled, except when the scanned image's distro is a trusted vendor, in which case Grype defaults apply for that scan. |
+
+**`adaptive` is the default mode**: out of the box, kubevuln keeps its
+no-false-negative posture for arbitrary images while trusted-vendor images
+are matched against their vendor's authoritative feed.
 
 Backward compatibility: the existing boolean keeps working and maps to
-`off`/`on`; the new value wins if both are set. Default mode is a decision for
-the team (see Open Questions).
+`off`/`on`; the new value wins if both are set.
 
 ### Per-scan decision
 
@@ -146,12 +149,11 @@ counts."
 
 ## Rollout
 
-1. Land the three-mode config in kubevuln with `on` as the default (no
-   behavior change for existing users).
-2. Verify Echo/Chainguard/Minimus feed coverage in the production Grype DB kubevuln
-   consumes (see Open Questions #2); validate against `kafka-ui` and the
-   packages from the reported false-positive list.
-3. Flip the default to `adaptive` in the helm chart once validated.
+1. Verify Echo/Chainguard/Minimus feed coverage in the production Grype DB
+   kubevuln consumes (see Open Questions #2); validate against `kafka-ui` and
+   the packages from the reported false-positive list.
+2. Land the three-mode config in kubevuln with `adaptive` as the default.
+   Users who pinned the existing boolean keep their current behavior.
 
 ## Open questions (for team discussion)
 
@@ -164,12 +166,10 @@ counts."
 2. **DB coverage verification.** The safety argument depends on the Echo
    provider actually being present in the Grype DB build we point kubevuln at
    (`ListingURL`). Needs a one-time verification and ideally a periodic check.
-3. **Default mode.** Is `adaptive` the right default for everyone, or do we
-   keep `on` and let customers using trusted-vendor images opt in?
-4. **Granularity of the trusted set.** Distro-type list only, or do we
+3. **Granularity of the trusted set.** Distro-type list only, or do we
    eventually want per-vendor knobs (e.g., trust Chainguard but not Echo)?
    The proposal assumes a flat list is enough.
-5. **Stock matcher.** Even in Grype's default config the "stock" matcher uses
+4. **Stock matcher.** Even in Grype's default config the "stock" matcher uses
    CPEs (this is also upstream Grype behavior). Do we leave it as upstream
    does for trusted images, or align fully with the vendor-feed-only stance?
 
