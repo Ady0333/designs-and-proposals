@@ -12,7 +12,7 @@
 
 Kubevuln enables Grype's CPE-based matching across language ecosystems to
 eliminate false negatives. This is the right trade-off for arbitrary images,
-but it systematically inflates results for **trusted image vendors** (Echo.io,
+but it systematically inflates results for **trusted image vendors** (Echo.ai,
 Chainguard, Minimus), vendors that maintain their own authoritative vulnerability
 feeds, already integrated upstream into the Grype database. For these images,
 CPE name-fuzzing adds only false positives: the vendor's feed already
@@ -26,7 +26,7 @@ vendored code.
 
 ## Motivation
 
-Echo.io reported that Kubevuln shows their images as
+Echo.ai reported that Kubevuln shows their images as
 2-3x "dirtier" than plain Grype:
 
 | `reg.echohq.com/kafka-ui` | Critical | High |
@@ -132,7 +132,7 @@ the mode instead of a boolean.
 Initial set, mirroring what Grype itself recognizes as standalone
 vendor-maintained distros with authoritative feeds:
 
-- `echo` (Echo.io)
+- `echo` (Echo.ai)
 - `chainguard` and `wolfi` (Chainguard)
 - `minimos` (Minimus)
 
