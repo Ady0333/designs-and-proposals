@@ -127,6 +127,22 @@ exactly as today. Two existing functions are touched conceptually:
 `getMatchers` gains awareness of the resolved distro, and the adapter carries
 the mode instead of a boolean.
 
+### Trust anchor: optional registry allowlist
+
+`/etc/os-release` is self-declared, so the distro check alone can be spoofed:
+any image could set `ID=echo` to receive lenient matching. To harden this,
+adaptive mode supports an **optional registry allowlist** (e.g.
+`reg.echohq.com/*`, `cgr.dev/*`). When an allowlist is configured, the
+adaptive bypass triggers only if **both** the distro **and** the source
+registry match; the distro alone is not enough.
+
+The allowlist is **optional by design**. Leaving it unset preserves the
+"private mirror" case, where an organization copies trusted-vendor images
+(e.g. Chainguard) into an internal registry: those images still carry the
+vendor's `/etc/os-release`, so distro-only matching keeps working for them.
+Setting an allowlist is the stricter posture for environments that want the
+registry to be an additional trust signal.
+
 ### Trusted vendor set
 
 Initial set, mirroring what Grype itself recognizes as standalone
@@ -157,19 +173,13 @@ counts."
 
 ## Open questions (for team discussion)
 
-1. **Trust anchor.** `/etc/os-release` is self-declared: any image can claim
-   `ID=echo` and receive lenient matching. Grype upstream accepts this trust
-   model. Do we? Options if not: AND the distro check with a registry
-   allowlist (`reg.echohq.com/*`, `cgr.dev/*`), or with signature
-   verification. Both add operational surface; the allowlist is cheap, the
-   signature path is not.
-2. **DB coverage verification.** The safety argument depends on the Echo
+1. **DB coverage verification.** The safety argument depends on the Echo
    provider actually being present in the Grype DB build we point kubevuln at
    (`ListingURL`). Needs a one-time verification and ideally a periodic check.
-3. **Granularity of the trusted set.** Distro-type list only, or do we
+2. **Granularity of the trusted set.** Distro-type list only, or do we
    eventually want per-vendor knobs (e.g., trust Chainguard but not Echo)?
    The proposal assumes a flat list is enough.
-4. **Stock matcher.** Even in Grype's default config the "stock" matcher uses
+3. **Stock matcher.** Even in Grype's default config the "stock" matcher uses
    CPEs (this is also upstream Grype behavior). Do we leave it as upstream
    does for trusted images, or align fully with the vendor-feed-only stance?
 
