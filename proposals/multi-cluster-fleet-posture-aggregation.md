@@ -206,6 +206,7 @@ type DriftedControl struct {
     Name           string            `json:"name"`
     BaselineStatus string            `json:"baselineStatus"`
     ClusterStatus  map[string]string `json:"clusterStatus"` // clusterID -> divergent status
+    Confidence     string            `json:"confidence"`    // "high" | "low" -- low when either cluster's ScanCoverage.Degraded is true
 }
 ```
 
@@ -220,7 +221,7 @@ New flags:
 | Flag | Meaning | Default |
 |---|---|---|
 | `--contexts` | Comma-separated kubeconfig context names to scan | all contexts in the active kubeconfig |
-| `--baseline` | Context whose results are the drift reference | first entry of `--contexts` (or current-context) |
+| `--baseline` | Context whose results are the drift reference; if set, it must be in `--contexts` or is automatically added to the scan set | first **explicitly listed** context in `--contexts` |
 
 ```bash
 # Scan three named contexts, drift-compare against staging
@@ -233,6 +234,21 @@ kubescape scan fleet --framework nsa --format json -o fleet.json
 `--contexts` is validated against the kubeconfig up front; unknown names are
 rejected before any scan starts. Reachability is **not** pre-checked: an
 unreachable-at-scan-time cluster is handled per-row (§3.6).
+
+**Baseline resolution** (validated up front, before any scan starts):
+
+- If `--baseline` is set, it must either already be present in `--contexts`, or
+  it is **automatically added** to the scan set (so drift always has a scanned
+  baseline to compare against). A baseline that names a context absent from the
+  kubeconfig is rejected.
+- If `--baseline` is not set, it defaults to the **first explicitly listed
+  context in `--contexts`** — not the kubeconfig's current-context and not
+  kubeconfig ordering — so drift is deterministic and independent of kubeconfig
+  file order.
+- If the resolved baseline cluster's scan fails (`Status != scanned`), the fleet
+  report is still produced but **without drift detection**, and a warning is
+  surfaced: `baseline cluster <name> could not be scanned -- drift detection
+  skipped`. The control matrix and per-cluster summary rows are unaffected.
 
 ### 3.5 Orchestrator
 
@@ -260,12 +276,32 @@ func (o *Orchestrator) Run(ctx context.Context, base *cautils.ScanInfo) (*FleetR
 5. On error: record `ClusterResult{Status: unreachable|error, Error: msg}` and
    **continue**: one bad cluster never aborts the fleet (§3.6).
 
-Only after the loop completes does `Run` build the control matrix
-(`report.go`: iterate each `ClusterResult.Report.SummaryDetails.Controls`, index
-by control ID) and drift list (compare each control's status per cluster against
-the baseline cluster's cell). Sequential execution is a hard invariant in
-Phase 1, enforced by the loop and asserted in tests; there is no goroutine, no
-`errgroup`, no shared mutable cross-cluster state.
+Only after the loop completes does `Run` build the control matrix and drift
+list. When building both, the aggregator **iterates only over `ClusterResult`
+entries whose `Status == scanned` and whose `Report != nil`**; entries for failed
+clusters (`Status != scanned`, `Report == nil`) are skipped so their nil
+`Report.SummaryDetails.Controls` is never dereferenced:
+
+- **Control matrix** (`report.go`): for each scanned cluster, iterate
+  `ClusterResult.Report.SummaryDetails.Controls`, indexed by control ID. Failed
+  clusters contribute no cells; their column renders as `-`/`unreachable`
+  (§3.6).
+- **Drift** (`report.go`): compare each control's status per scanned cluster
+  against the baseline cluster's cell. Failed clusters are not compared and do
+  not count toward the drift set. Each `DriftedControl` carries a `Confidence`
+  field: it is set to `"low"` when **either** the baseline cluster or the
+  compared cluster has `ScanCoverage.Degraded == true` (e.g. RBAC blocked a
+  resource type, so the divergence may be a coverage artifact rather than a real
+  drift), and `"high"` otherwise. The fleet printer renders low-confidence drift
+  entries with a visual indicator (a `~` marker and a `low-confidence` note) so
+  operators can tell a solid divergence from one that needs corroboration.
+
+A failed cluster still appears in the fleet report's per-cluster **summary row**
+with its `Status` and `Error` message, so operators see the gap; it simply does
+not contribute to the control matrix or the drift calculation. Sequential
+execution is a hard invariant in Phase 1, enforced by the loop and asserted in
+tests; there is no goroutine, no `errgroup`, no shared mutable cross-cluster
+state.
 
 ### 3.6 Per-cluster error isolation
 
@@ -308,8 +344,8 @@ C-0038    Host PID/IPC privileges           High     ●      ●      -
 ...
 
 Drift vs. baseline "staging" (2 controls diverge):
-  C-0016  staging=passed   prod=failed
-  C-0260  staging=passed   prod=failed
+  C-0016    staging=passed   prod=failed
+  C-0260  ~ staging=passed   prod=failed   (low-confidence: prod coverage degraded)
 
 2 of 3 clusters scanned; 1 unreachable. Fleet gate: FAIL (prod < threshold).
 ```
