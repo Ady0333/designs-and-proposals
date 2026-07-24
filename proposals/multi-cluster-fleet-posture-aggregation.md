@@ -258,6 +258,11 @@ unreachable-at-scan-time cluster is handled per-row (§3.6).
   report is still produced but **without drift detection**, and a warning is
   surfaced: `baseline cluster <name> could not be scanned -- drift detection
   skipped`. The control matrix and per-cluster summary rows are unaffected.
+- The resolved baseline value, whether explicitly set via `--baseline` or
+  defaulted to the first context in `--contexts`, is written to
+  `FleetMetadata.Baseline` in the output. Downstream consumers read that field to
+  identify which context was used as the drift reference, rather than having to
+  re-derive it from the flags.
 
 ### 3.5 Orchestrator
 
@@ -452,6 +457,18 @@ config and the resource map, so the scan rebuilds them against the correct
 cluster. On leave it returns the process to a clean baseline, so the next
 iteration starts from a known state rather than from whatever the previous scan
 left behind.
+
+The leave/reset operation is registered with `defer` before the scan runs, not
+called after it returns. This matters because a scan can fail partway: if the
+reset ran only on the success path, a scan error would leave the cached config,
+the resource map, and the active context still attached to the failed cluster and
+poison the next iteration. Deferring the reset guarantees it runs whether the scan
+succeeds, returns an error, or panics.
+
+After the full fleet run completes, the helper also restores the original
+kubeconfig context that was active before the fleet command ran, so the fleet
+command does not leave the process (or a reused client) pointed at the last
+scanned cluster.
 
 The PR includes a two-kind-cluster integration test: it scans two kind clusters
 in a row within one process and asserts that the second report describes the
