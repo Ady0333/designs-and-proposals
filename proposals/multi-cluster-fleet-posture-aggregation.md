@@ -220,15 +220,24 @@ New flags:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--contexts` | Comma-separated kubeconfig context names to scan | all contexts in the active kubeconfig |
+| `--contexts` | Comma-separated kubeconfig context names to scan | **required, no default** |
 | `--baseline` | Context whose results are the drift reference; if set, it must be in `--contexts` or is automatically added to the scan set | first **explicitly listed** context in `--contexts` |
+
+`--contexts` is required. There is deliberately no "scan every context in the
+kubeconfig" default. A host scan deploys a DaemonSet (the host sensor) into each
+scanned cluster to collect node-level data, so scanning every context in the
+active kubeconfig by default would deploy workloads into every cluster that
+kubeconfig can reach, including production or third-party clusters the user never
+intended to touch. Requiring an explicit context list makes the blast radius of
+a fleet scan something the user states on purpose, not something inferred from
+whatever happens to be in the kubeconfig.
 
 ```bash
 # Scan three named contexts, drift-compare against staging
 kubescape scan fleet --contexts prod,staging,dr --baseline staging
 
-# Scan every context in the kubeconfig with the NSA framework, JSON out
-kubescape scan fleet --framework nsa --format json -o fleet.json
+# Scan two named contexts with the NSA framework, JSON out
+kubescape scan fleet --contexts prod,staging --framework nsa --format json -o fleet.json
 ```
 
 `--contexts` is validated against the kubeconfig up front; unknown names are
@@ -242,8 +251,8 @@ unreachable-at-scan-time cluster is handled per-row (§3.6).
   baseline to compare against). A baseline that names a context absent from the
   kubeconfig is rejected.
 - If `--baseline` is not set, it defaults to the **first explicitly listed
-  context in `--contexts`** — not the kubeconfig's current-context and not
-  kubeconfig ordering — so drift is deterministic and independent of kubeconfig
+  context in `--contexts`**, not the kubeconfig's current-context and not
+  kubeconfig ordering, so drift is deterministic and independent of kubeconfig
   file order.
 - If the resolved baseline cluster's scan fails (`Status != scanned`), the fleet
   report is still produced but **without drift detection**, and a warning is
@@ -377,6 +386,16 @@ Drift vs. baseline "staging" (2 controls diverge):
    SaaS). Fleet history/trends and an operator-side fleet CRD are called out as
    Phase 2+ and may be where the OSS/commercial boundary should sit. Maintainer
    guidance wanted on where to stop.
+5. **Cluster state isolation between sequential scans. RESOLVED.** The earlier
+   open question was whether looping the existing single-cluster scan path over
+   several contexts in one process is enough to produce correct per-cluster
+   reports. It is not. Sequential invocation alone leaves process-global state
+   (the active context, the cached Kubernetes config, and the resource map) set
+   from the first cluster, so later scans read stale state and can describe the
+   wrong cluster. The resolution is explicit per-cluster state reset, not just
+   sequential invocation: an enter/leave helper resets that state around each
+   cluster scan. This is the chosen approach and is specified as PR 1 in the
+   Prerequisites section (§6).
 
 ## 5. Alternatives considered
 
@@ -401,7 +420,58 @@ Drift vs. baseline "staging" (2 controls diverge):
   duplicated in every user's CI. The value of this feature is precisely that
   those become first-class, tested, and shared.
 
-## 6. Implementation plan
+## 6. Prerequisites
+
+Two isolation fixes must land before the fleet command is built. Both address the
+same underlying fact: a Kubescape process carries mutable global state that is set
+once at CLI start and never reset. The single-cluster CLI never noticed, because
+it scans one cluster and exits. A sequential fleet loop reuses that state across
+clusters in one process, so without these fixes the second and later scans read
+state left behind by the first and can report on the wrong cluster.
+
+### 6.1 PR 1: client config and resource map isolation (this proposal's author)
+
+After a single-cluster scan, three pieces of process-global state remain set to
+the first cluster:
+
+- The active context name, set by `k8sinterface.SetClusterContextName`
+  (`cmd/root.go:61`).
+- The cached Kubernetes client config returned by `k8sinterface.GetK8sConfig`
+  (`core/core/scan.go:254`), which memoizes the config for the selected context.
+- The resource map built by `InitializeMapResources`, which maps resources to API
+  groups off the connected cluster's discovery API.
+
+A second scan in the same process inherits all three. Re-pointing the context
+with `SetClusterContextName` alone is not enough: the cached config and the
+resource map still describe the first cluster, so the second scan can silently
+collect and report on the wrong one.
+
+This PR adds an enter/leave helper that resets those three pieces of state around
+each cluster scan. On enter it sets the target context and clears the cached
+config and the resource map, so the scan rebuilds them against the correct
+cluster. On leave it returns the process to a clean baseline, so the next
+iteration starts from a known state rather than from whatever the previous scan
+left behind.
+
+The PR includes a two-kind-cluster integration test: it scans two kind clusters
+in a row within one process and asserts that the second report describes the
+second cluster (its nodes, namespaces, or cluster identity), not the first. This
+test fails on `main` today, where the second report still describes the first
+cluster. That failure proves the isolation gap exists independently of the fleet
+feature: it is a latent bug in running two scans in one process, and the fleet
+command is simply the first caller that does so. The fleet command cannot produce
+correct per-cluster reports until this test passes.
+
+### 6.2 PR 2: PolicyHandler singleton isolation (issue #2005)
+
+`PolicyHandler` holds its own process-level state that is likewise not reset
+between scans. This is tracked separately as
+[issue #2005](https://github.com/kubescape/kubescape/issues/2005) and is **out of
+scope for this proposal**. It is named here only so the full isolation surface is
+visible: the fleet command depends on it landing, but the work and its review
+belong to that issue, not this one.
+
+## 7. Implementation plan
 
 ### Phase 1: foundational, mergeable slice (this proposal)
 
@@ -429,7 +499,7 @@ changes elsewhere.
 
 These are named here only to scope them **out** of Phase 1.
 
-## 7. Estimated scope
+## 8. Estimated scope
 
 - **New files:** ~6 - `core/pkg/fleet/{types,orchestrator,report}.go`,
   `cmd/scan/fleet.go`, `core/pkg/resultshandling/printer/v2/fleetprinter.go`,
@@ -451,7 +521,7 @@ These are named here only to scope them **out** of Phase 1.
   clear "done." That structure, plus the honest Phase 2 deferral gated on a
   named upstream issue, makes this a good **LFX mentorship term** project.
 
-## 8. Impact
+## 9. Impact
 
 **What becomes possible**
 
@@ -475,7 +545,7 @@ These are named here only to scope them **out** of Phase 1.
 - Establishes the first type above `PostureReport`, which an operator fleet CRD
   and fleet-history features can build on without re-litigating the schema.
 
-## 9. References
+## 10. References
 
 - [kubescape/kubescape#2004: k8s client is a global singleton](https://github.com/kubescape/kubescape/issues/2004) (the concurrency blocker; motivates sequential-only Phase 1)
 - Scan entry point reused unmodified: `core/core/scan.go:183` - `func (ks *Kubescape) Scan(scanInfo *cautils.ScanInfo) (*resultshandling.ResultsHandler, error)`
